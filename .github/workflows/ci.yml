@@ -1,0 +1,137 @@
+name: CI
+
+# As in llmman: every commit on main is a release, tagged v<version> by
+# packaging/version.sh. Same five targets as llmman's release binaries,
+# since each package ships the matching one.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The llmman release every leg bundles, resolved once so a llmman
+  # release landing mid-run cannot split them.
+  llmman:
+    name: Resolve llmman release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tag=$(gh release view --repo llmmanorg/llmman --json tagName --jq .tagName)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + test (${{ matrix.target }})
+    needs: llmman
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            check-fmt: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # fetch-depth: 0 — packaging/version.sh needs the full commit count.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set release version
+        run: packaging/version.sh --apply
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # wry's webview on Linux is WebKitGTK; tao's windows are GTK.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: cargo fmt --check
+        if: matrix.check-fmt
+        run: cargo fmt --check
+
+      - name: Lint packaging scripts
+        if: matrix.check-fmt
+        run: shellcheck packaging/*.sh
+
+      - name: cargo clippy
+        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: packaging/package.sh ${{ matrix.target }} "$(packaging/version.sh)" ${{ needs.llmman.outputs.tag }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llmman-desktop-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [llmman, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLMMAN_TAG: ${{ needs.llmman.outputs.tag }}
+        run: |
+          tag="v$(packaging/version.sh)"
+          (cd dist && sha256sum -- * > checksums.txt)
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$tag" --notes "Bundles llmman [$LLMMAN_TAG](https://github.com/llmmanorg/llmman/releases/tag/$LLMMAN_TAG)."

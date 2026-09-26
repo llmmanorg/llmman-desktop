@@ -1,0 +1,18 @@
+[package]
+name = "llmman-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "llmman's web UI in a native window over a local llmman serve"
+license = "Apache-2.0"
+repository = "https://github.com/llmmanorg/llmman-desktop"
+publish = false
+
+[dependencies]
+tao = "0.37.0"
+wry = "0.57.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.20.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
